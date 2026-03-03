@@ -94,7 +94,7 @@ jobs:
           CADDY_VER="${{ needs.check-version.outputs.caddy_ver }}"
           
           # ⚠️ 环境变量配置文件路径 (你可以随时修改这个变量改变挂载读取路径)
-          ENV_FILE_PATH="/etc/caddy/.env"
+          ENV_FILE_PATH="/root/.env"
           
           cat <<EOF > entrypoint_pure.sh
           #!/bin/sh
