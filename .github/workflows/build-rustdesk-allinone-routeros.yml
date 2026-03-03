@@ -1,0 +1,156 @@
+name: rustdesk-allinone-routeros-auto
+
+# 纯手动触发，无需输入参数
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  IMAGE_NAME: rustdesk-allinone
+
+jobs:
+  build-push-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 【核心新增】自动通过 GitHub API 获取官方最新的 Release Tag
+      - name: Get latest upstream versions
+        id: get_version
+        run: |
+          # 获取 API 的最新版本，如果获取失败则默认 fallback 到 master
+          API_VER=$(curl -s https://api.github.com/repos/lejianwen/rustdesk-api/releases/latest | jq -r .tag_name)
+          [ "$API_VER" = "null" ] || [ -z "$API_VER" ] && API_VER="master"
+          
+          # 获取 Web 前端的最新版本
+          WEB_VER=$(curl -s https://api.github.com/repos/lejianwen/rustdesk-api-web/releases/latest | jq -r .tag_name)
+          [ "$WEB_VER" = "null" ] || [ -z "$WEB_VER" ] && WEB_VER="master"
+          
+          echo "检测到最新版本 -> API: $API_VER, WEB: $WEB_VER"
+          
+          # 传递给下游步骤使用
+          echo "api_version=$API_VER" >> $GITHUB_OUTPUT
+          echo "web_version=$WEB_VER" >> $GITHUB_OUTPUT
+
+      - name: Generate Dockerfile (all-in-one)
+        run: |
+          cat > Dockerfile <<'EOF'
+          FROM golang:1.23-alpine AS api_builder
+
+          ARG RUSTDESK_API_REF=master
+          ARG RUSTDESK_API_WEB_REF=master
+
+          RUN apk add --no-cache \
+              git bash ca-certificates tzdata \
+              build-base sqlite-dev \
+              nodejs npm
+
+          WORKDIR /src
+          RUN git clone --depth 1 --branch "${RUSTDESK_API_REF}" https://github.com/lejianwen/rustdesk-api.git .
+
+          RUN set -eux; \
+              cd resources; \
+              mkdir -p admin; \
+              git clone --depth 1 --branch "${RUSTDESK_API_WEB_REF}" https://github.com/lejianwen/rustdesk-api-web.git; \
+              cd rustdesk-api-web; \
+              npm ci; \
+              npm run build; \
+              cp -a dist/* ../admin/
+
+          ENV CGO_ENABLED=1 GOOS=linux
+          RUN set -eux; \
+              mkdir -p /out; \
+              go mod download; \
+              go build -o /out/apimain cmd/apimain.go; \
+              cp -a conf /out/conf; \
+              cp -a resources /out/resources; \
+              cp -a docs /out/docs 2>/dev/null || true; \
+              mkdir -p /out/data /out/runtime
+
+          FROM rustdesk/rustdesk-server-s6:latest
+
+          RUN apk add --no-cache tzdata ca-certificates
+
+          WORKDIR /app
+          COPY --from=api_builder /out/ /app/
+
+          # S6 进程守护 (保留了 exec 防止 RouterOS 僵尸进程)
+          RUN set -eux; \
+              mkdir -p /etc/s6-overlay/s6-rc.d/api; \
+              printf "key-secret\nhbbs\n" > /etc/s6-overlay/s6-rc.d/api/dependencies; \
+              echo "longrun" > /etc/s6-overlay/s6-rc.d/api/type; \
+              printf "%s\n" "#!/command/with-contenv sh" "cd /app" "exec ./apimain" > /etc/s6-overlay/s6-rc.d/api/run; \
+              chmod +x /etc/s6-overlay/s6-rc.d/api/run; \
+              touch /etc/s6-overlay/s6-rc.d/user/contents.d/api; \
+              echo "/package/admin/s6/command/s6-svstat /run/s6-rc/servicedirs/api || exit 1" >> /usr/bin/healthcheck.sh; \
+              ln -sf /run /var/run
+
+          VOLUME /data
+          VOLUME /app/data
+
+          EXPOSE 21114 21115 21116 21116/udp 21117 21118 21119
+
+          ENV RELAY=relay.example.com \
+              ENCRYPTED_ONLY=0 \
+              TZ=Asia/Shanghai
+
+          ENTRYPOINT ["/init"]
+          EOF
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push multi-arch image to GHCR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            RUSTDESK_API_REF=${{ steps.get_version.outputs.api_version }}
+            RUSTDESK_API_WEB_REF=${{ steps.get_version.outputs.web_version }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ steps.get_version.outputs.api_version }}
+            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Build amd64 image (local) and docker save
+        run: |
+          docker buildx build --platform linux/amd64 --load \
+            -f Dockerfile \
+            --build-arg RUSTDESK_API_REF=${{ steps.get_version.outputs.api_version }} \
+            --build-arg RUSTDESK_API_WEB_REF=${{ steps.get_version.outputs.web_version }} \
+            -t ${IMAGE_NAME}:${{ steps.get_version.outputs.api_version }}-amd64 .
+          docker save ${IMAGE_NAME}:${{ steps.get_version.outputs.api_version }}-amd64 -o ${IMAGE_NAME}-${{ steps.get_version.outputs.api_version }}-amd64.tar
+
+      - name: Build arm64 image (local) and docker save
+        run: |
+          docker buildx build --platform linux/arm64 --load \
+            -f Dockerfile \
+            --build-arg RUSTDESK_API_REF=${{ steps.get_version.outputs.api_version }} \
+            --build-arg RUSTDESK_API_WEB_REF=${{ steps.get_version.outputs.web_version }} \
+            -t ${IMAGE_NAME}:${{ steps.get_version.outputs.api_version }}-arm64 .
+          docker save ${IMAGE_NAME}:${{ steps.get_version.outputs.api_version }}-arm64 -o ${IMAGE_NAME}-${{ steps.get_version.outputs.api_version }}-arm64.tar
+
+      - name: Create GitHub Release and upload RouterOS tar assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.get_version.outputs.api_version }}
+          name: RustDesk All-in-One ${{ steps.get_version.outputs.api_version }}
+          files: |
+            ${{ env.IMAGE_NAME }}-${{ steps.get_version.outputs.api_version }}-amd64.tar
+            ${{ env.IMAGE_NAME }}-${{ steps.get_version.outputs.api_version }}-arm64.tar
