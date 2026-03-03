@@ -18,6 +18,7 @@ permissions:
 
 env:
   IMAGE_NAME: rustdesk-allinone
+  BUILDKIT_PROGRESS: plain
 
 jobs:
   build-push-and-release:
@@ -54,12 +55,9 @@ jobs:
           ENV CGO_ENABLED=1 GOOS=linux
           RUN set -x; \
               mkdir -p /out/data /out/runtime; \
-              # 自动整理依赖，防止老版本 go.mod 报错
               go mod tidy || true; \
               go mod download || exit 1; \
-              # 编译并输出详细日志 (-v)，如果失败直接暴露死因
-              go build -v -ldflags "-s -w" -o /out/apimain . || exit 1; \
-              # 安全拷贝：如果有这个文件夹才拷，没有就跳过，绝对不报错！
+              go build -v -ldflags "-s -w" -o /out/apimain ./cmd/apimain.go || exit 1; \
               [ -d conf ] && cp -a conf /out/conf || true; \
               [ -d resources ] && cp -a resources /out/resources || true; \
               [ -d docs ] && cp -a docs /out/docs || true
@@ -125,7 +123,6 @@ jobs:
           context: .
           file: Dockerfile
           push: true
-          # 先只编 amd64，跑通了你要 arm64 我们再加上
           platforms: linux/amd64
           build-args: |
             RUSTDESK_API_REF=${{ github.event.inputs.api_version }}
@@ -133,6 +130,11 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ github.event.inputs.api_version }}
             ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
+          provenance: false
+          sbom: false
+          no-cache: false
+          pull: true
+          outputs: type=registry
 
       - name: Build amd64 image (local) and docker save
         run: |
