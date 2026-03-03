@@ -58,8 +58,8 @@ jobs:
           RUN set -eux; \
               mkdir -p /out; \
               go mod download; \
-              # 恢复了静态编译参数，确保 SQLite 库被完全打包，消除底层依赖隐患
-              go build -a -ldflags "-s -w -extldflags '-static -fpic'" -installsuffix cgo -o /out/apimain cmd/apimain.go; \
+              # 最终环境已是 Alpine，无需静态链接，直接基础编译即可
+              go build -ldflags "-s -w" -o /out/apimain cmd/apimain.go; \
               cp -a conf /out/conf; \
               cp -a resources /out/resources; \
               cp -a docs /out/docs 2>/dev/null || true; \
