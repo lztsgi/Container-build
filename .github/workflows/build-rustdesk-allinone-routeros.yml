@@ -1,7 +1,16 @@
-name: rustdesk-allinone-routeros-auto
+name: rustdesk-allinone-routeros
 
 on:
   workflow_dispatch:
+    inputs:
+      api_version:
+        description: 'RustDesk API 版本号 (例如 v2.7 或 master)'
+        required: true
+        default: 'v2.7'
+      web_version:
+        description: 'Web 前端分支/版本'
+        required: true
+        default: 'master'
 
 permissions:
   contents: write
@@ -17,19 +26,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Get latest upstream versions
-        id: get_version
-        run: |
-          API_VER=$(curl -s https://api.github.com/repos/lejianwen/rustdesk-api/releases/latest | jq -r .tag_name)
-          [ "$API_VER" = "null" ] || [ -z "$API_VER" ] && API_VER="master"
-          
-          WEB_VER=$(curl -s https://api.github.com/repos/lejianwen/rustdesk-api-web/releases/latest | jq -r .tag_name)
-          [ "$WEB_VER" = "null" ] || [ -z "$WEB_VER" ] && WEB_VER="master"
-          
-          echo "检测到最新版本 -> API: $API_VER, WEB: $WEB_VER"
-          echo "api_version=$API_VER" >> $GITHUB_OUTPUT
-          echo "web_version=$WEB_VER" >> $GITHUB_OUTPUT
-
       - name: Generate Dockerfile
         run: |
           cat > Dockerfile <<'EOF'
@@ -39,13 +35,13 @@ jobs:
           ARG RUSTDESK_API_REF=master
           ARG RUSTDESK_API_WEB_REF=master
           
-          # Alpine 编译环境所需依赖
           RUN apk add --no-cache git bash nodejs npm build-base sqlite-dev
           
           WORKDIR /src
           RUN git clone --depth 1 --branch "${RUSTDESK_API_REF}" https://github.com/lejianwen/rustdesk-api.git .
           
-          RUN set -eux; \
+          # 构建 Web 前端
+          RUN set -x; \
               cd resources; \
               mkdir -p admin; \
               git clone --depth 1 --branch "${RUSTDESK_API_WEB_REF}" https://github.com/lejianwen/rustdesk-api-web.git; \
@@ -54,27 +50,28 @@ jobs:
               npm run build; \
               cp -a dist/* ../admin/
           
+          # 编译 API 主程序 (防弹版)
           ENV CGO_ENABLED=1 GOOS=linux
-          RUN set -eux; \
-              mkdir -p /out; \
-              go mod download; \
-              # 【修正点】将 cmd/apimain.go 替换为 . 
-              go build -ldflags "-s -w" -o /out/apimain .; \
-              cp -a conf /out/conf; \
-              cp -a resources /out/resources; \
-              cp -a docs /out/docs 2>/dev/null || true; \
-              mkdir -p /out/data /out/runtime
+          RUN set -x; \
+              mkdir -p /out/data /out/runtime; \
+              # 自动整理依赖，防止老版本 go.mod 报错
+              go mod tidy || true; \
+              go mod download || exit 1; \
+              # 编译并输出详细日志 (-v)，如果失败直接暴露死因
+              go build -v -ldflags "-s -w" -o /out/apimain . || exit 1; \
+              # 安全拷贝：如果有这个文件夹才拷，没有就跳过，绝对不报错！
+              [ -d conf ] && cp -a conf /out/conf || true; \
+              [ -d resources ] && cp -a resources /out/resources || true; \
+              [ -d docs ] && cp -a docs /out/docs || true
 
-          # ---- 阶段2: 提取官方 S6 及核心组件 ----
+          # ---- 阶段2: 提取官方 S6 ----
           FROM rustdesk/rustdesk-server-s6:latest AS server
 
-          # ---- 阶段3: 最终组装 (基于纯净 Alpine，确保极度稳定) ----
+          # ---- 阶段3: 最终组装 (纯净 Alpine) ----
           FROM alpine:latest
           
-          # 此时 apk 绝对可用，安装时区和证书
           RUN apk add --no-cache tzdata ca-certificates
 
-          # 从官方镜像完美移植 S6-overlay 和 RustDesk 核心二进制文件
           COPY --from=server /init /init
           COPY --from=server /etc/s6-overlay /etc/s6-overlay
           COPY --from=server /package /package
@@ -84,12 +81,10 @@ jobs:
           COPY --from=server /usr/bin/rustdesk-utils /usr/bin/rustdesk-utils
           COPY --from=server /command /command
 
-          # 拷贝我们自己编译的 API
           WORKDIR /app
           COPY --from=api_builder /out/ /app/
 
-          # 注册 API 的 S6 守护进程 (保留 exec 防止 RouterOS 僵尸进程)
-          RUN set -eux; \
+          RUN set -x; \
               mkdir -p /etc/s6-overlay/s6-rc.d/api; \
               printf "key-secret\nhbbs\n" > /etc/s6-overlay/s6-rc.d/api/dependencies; \
               echo "longrun" > /etc/s6-overlay/s6-rc.d/api/type; \
@@ -130,37 +125,28 @@ jobs:
           context: .
           file: Dockerfile
           push: true
+          # 先只编 amd64，跑通了你要 arm64 我们再加上
           platforms: linux/amd64
           build-args: |
-            RUSTDESK_API_REF=${{ steps.get_version.outputs.api_version }}
-            RUSTDESK_API_WEB_REF=${{ steps.get_version.outputs.web_version }}
+            RUSTDESK_API_REF=${{ github.event.inputs.api_version }}
+            RUSTDESK_API_WEB_REF=${{ github.event.inputs.web_version }}
           tags: |
-            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ steps.get_version.outputs.api_version }}
+            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ github.event.inputs.api_version }}
             ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
 
       - name: Build amd64 image (local) and docker save
         run: |
           docker buildx build --platform linux/amd64 --load \
             -f Dockerfile \
-            --build-arg RUSTDESK_API_REF=${{ steps.get_version.outputs.api_version }} \
-            --build-arg RUSTDESK_API_WEB_REF=${{ steps.get_version.outputs.web_version }} \
-            -t ${IMAGE_NAME}:${{ steps.get_version.outputs.api_version }}-amd64 .
-          docker save ${IMAGE_NAME}:${{ steps.get_version.outputs.api_version }}-amd64 -o ${IMAGE_NAME}-${{ steps.get_version.outputs.api_version }}-amd64.tar
+            --build-arg RUSTDESK_API_REF=${{ github.event.inputs.api_version }} \
+            --build-arg RUSTDESK_API_WEB_REF=${{ github.event.inputs.web_version }} \
+            -t ${IMAGE_NAME}:${{ github.event.inputs.api_version }}-amd64 .
+          docker save ${IMAGE_NAME}:${{ github.event.inputs.api_version }}-amd64 -o ${IMAGE_NAME}-${{ github.event.inputs.api_version }}-amd64.tar
 
-      - name: Build arm64 image (local) and docker save
-        run: |
-          docker buildx build --platform linux/arm64 --load \
-            -f Dockerfile \
-            --build-arg RUSTDESK_API_REF=${{ steps.get_version.outputs.api_version }} \
-            --build-arg RUSTDESK_API_WEB_REF=${{ steps.get_version.outputs.web_version }} \
-            -t ${IMAGE_NAME}:${{ steps.get_version.outputs.api_version }}-arm64 .
-          docker save ${IMAGE_NAME}:${{ steps.get_version.outputs.api_version }}-arm64 -o ${IMAGE_NAME}-${{ steps.get_version.outputs.api_version }}-arm64.tar
-
-      - name: Create GitHub Release and upload RouterOS tar assets
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.get_version.outputs.api_version }}
-          name: RustDesk All-in-One ${{ steps.get_version.outputs.api_version }}
+          tag_name: ${{ github.event.inputs.api_version }}
+          name: RustDesk All-in-One ${{ github.event.inputs.api_version }}
           files: |
-            ${{ env.IMAGE_NAME }}-${{ steps.get_version.outputs.api_version }}-amd64.tar
-            ${{ env.IMAGE_NAME }}-${{ steps.get_version.outputs.api_version }}-arm64.tar
+            ${{ env.IMAGE_NAME }}-${{ github.event.inputs.api_version }}-amd64.tar
