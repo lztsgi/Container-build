@@ -246,7 +246,7 @@ jobs:
                 - `CHECK_MODE=ipv6` : 等待 IPv6 Global 地址 (推荐 ROS 用户)
                 - `CHECK_MODE=ipv4` : 等待 IPv4 地址
                 - `CHECK_MODE=auto` : 任意 IP 即启动 (默认)
-             3. **文件读取 Token 特性**: 镜像启动时会自动检测并读取 `/etc/caddy/.env` 文件（若存在），支持将含有高敏感信息（如 Cloudflare Token）的环境变量文件进行挂载引用，完美兼容原有环境变量部署方式。
+             3. **文件读取 Token 特性**: 镜像启动时会自动检测并读取 `/root/.env` 文件（若存在），支持将含有高敏感信息（如 Cloudflare Token）的环境变量文件进行挂载引用，完美兼容原有环境变量部署方式。
              
              ### 📂 文件列表
              1. `caddy-linux-v...` : 二进制文件
