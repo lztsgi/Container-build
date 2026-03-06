@@ -1,4 +1,4 @@
-name: Build-Phantun-1
+name: Build-Phantun
 
 on:
   workflow_dispatch:
@@ -42,7 +42,7 @@ jobs:
         shell: bash
         run: |
           cat > Dockerfile.alpine <<'EOF'
-          FROM rust:1.88-alpine AS builder
+          FROM rust:alpine AS builder
 
           WORKDIR /src
 
@@ -54,7 +54,9 @@ jobs:
 
           COPY . .
 
+          # 只构建 phantun 包，避免 workspace 额外干扰
           RUN cargo build -p phantun --release --locked --bins
+
           RUN strip /src/target/release/client /src/target/release/server || true
 
           FROM alpine:3.20
