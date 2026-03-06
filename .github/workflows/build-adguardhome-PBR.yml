@@ -8,7 +8,8 @@ on:
 permissions:
   contents: write
   packages: write
-
+  
+# ⚠️ 构建版本判断：判断官方与自己仓库版本，不一致会自动构建，一致跳过，除非手动构建（强制run，忽略跳过）
 jobs:
   check-version:
     runs-on: ubuntu-latest
@@ -23,7 +24,7 @@ jobs:
           AH_VER=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/AdguardTeam/AdGuardHome/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
           if [ -z "$AH_VER" ]; then echo "Error: Failed to fetch upstream version!" && exit 1; fi
           
-          # 2. 获取你自己仓库当前已发布的最新版本
+          # 2. 获取自己仓库当前已发布的最新版本
           LOCAL_VER=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ github.repository }}/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
           
           echo "Upstream AdGuardHome version: $AH_VER"
@@ -155,7 +156,7 @@ jobs:
           tag_name: ${{ needs.check-version.outputs.ah_ver }}
           name: AdGuardHome PBR ${{ needs.check-version.outputs.ah_ver }}
           make_latest: true
-          allow_updates: true
+          overwrite_files: true
           body: |
              ## 📦 AdGuardHome for RouterOS (PBR Edition)
              - **AdGuardHome Version**: ${{ needs.check-version.outputs.ah_ver }}
