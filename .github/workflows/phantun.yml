@@ -42,7 +42,7 @@ jobs:
         shell: bash
         run: |
           cat > Dockerfile.alpine <<'EOF'
-          FROM rust:1.85-alpine3.20 AS builder
+          FROM rust:1.88-alpine AS builder
 
           WORKDIR /src
 
@@ -54,8 +54,8 @@ jobs:
 
           COPY . .
 
-          RUN cargo build --release --locked --bins
-          RUN strip target/release/client target/release/server || true
+          RUN cargo build -p phantun --release --locked --bins
+          RUN strip /src/target/release/client /src/target/release/server || true
 
           FROM alpine:3.20
 
@@ -150,7 +150,6 @@ jobs:
           merge-multiple: true
 
       - name: Check files
-        shell: bash
         run: ls -lh dist
 
       - name: Publish release
