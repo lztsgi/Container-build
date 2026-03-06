@@ -18,7 +18,9 @@ jobs:
       - name: Get Upstream Version
         id: get_versions
         run: |
-          AH_VER=$(curl -s https://api.github.com/repos/AdguardTeam/AdGuardHome/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+          # 修复点：加入鉴权 Token 避免 GitHub API 匿名限流，并加入防空值检查
+          AH_VER=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/AdguardTeam/AdGuardHome/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$AH_VER" ]; then echo "Error: Failed to fetch AdGuardHome version!" && exit 1; fi
           echo "ah_ver=$AH_VER" >> $GITHUB_OUTPUT
 
   build-and-release:
