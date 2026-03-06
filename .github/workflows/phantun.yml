@@ -1,4 +1,4 @@
-name: Build-Phantun-test
+name: Build-Phantun
 
 on:
   workflow_dispatch:
@@ -13,18 +13,16 @@ permissions:
 
 jobs:
   build:
-    name: Build ${{ matrix.arch_label }}
+    name: Build ${{ matrix.arch }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch_label: amd64
+          - arch: amd64
             platform: linux/amd64
-          - arch_label: arm64
+          - arch: arm64
             platform: linux/arm64
-          - arch_label: arm
-            platform: linux/arm/v7
 
     steps:
       - name: Checkout official source
@@ -44,14 +42,7 @@ jobs:
         shell: bash
         run: |
           cat > Dockerfile.alpine <<'EOF'
-          # ==========================================================
-          # Builder stage
-          # 说明：
-          # - 不做奇怪压缩，不用 UPX
-          # - 用官方源码 + Cargo.lock 复现
-          # - LTO + 单 codegen unit：兼顾体积与性能
-          # ==========================================================
-          FROM rust:1.81-alpine3.20 AS builder
+          FROM rust:1.85-alpine3.20 AS builder
 
           WORKDIR /src
 
@@ -64,16 +55,8 @@ jobs:
           COPY . .
 
           RUN cargo build --release --locked --bins
-
           RUN strip target/release/client target/release/server || true
 
-          # ==========================================================
-          # Runtime stage
-          # 说明：
-          # - 继续用 Alpine，兼顾体积与 RouterOS 导入兼容性
-          # - 不装 tzdata / ca-certificates，Phantun 本身不需要
-          # - 保持你现有环境变量接口不变
-          # ==========================================================
           FROM alpine:3.20
 
           COPY --from=builder /src/target/release/client /usr/local/bin/phantun-client
@@ -104,7 +87,7 @@ jobs:
 
           EXTRA_ARGS=""
 
-          # 保持你的环境变量名不变，只修正映射到官方正确 CLI 参数
+          # 保持你的环境变量名不变
           if [ -n "${TUN_NAME:-}" ]; then
             EXTRA_ARGS="$EXTRA_ARGS --tun ${TUN_NAME}"
           fi
@@ -132,10 +115,10 @@ jobs:
           ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
           EOF
 
-      - name: Build docker-archive tar for RouterOS import
+      - name: Build docker archive tar
         shell: bash
         run: |
-          FILENAME="${{ env.FILE_PREFIX }}-${{ env.APP_VERSION }}-${{ matrix.arch_label }}.tar"
+          FILENAME="${{ env.FILE_PREFIX }}-${{ env.APP_VERSION }}-${{ matrix.arch }}.tar"
 
           docker buildx build \
             --platform "${{ matrix.platform }}" \
@@ -146,13 +129,12 @@ jobs:
             .
 
           ls -lh "${FILENAME}"
-          echo "Generated ${FILENAME}"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.FILE_PREFIX }}-${{ env.APP_VERSION }}-${{ matrix.arch_label }}
-          path: ${{ env.FILE_PREFIX }}-${{ env.APP_VERSION }}-${{ matrix.arch_label }}.tar
+          name: ${{ env.FILE_PREFIX }}-${{ env.APP_VERSION }}-${{ matrix.arch }}
+          path: ${{ env.FILE_PREFIX }}-${{ env.APP_VERSION }}-${{ matrix.arch }}.tar
           if-no-files-found: error
 
   release:
@@ -161,16 +143,15 @@ jobs:
     needs: build
 
     steps:
-      - name: Download all built tars
+      - name: Download all tars
         uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
-      - name: Show release files
+      - name: Check files
         shell: bash
-        run: |
-          ls -lh dist
+        run: ls -lh dist
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
