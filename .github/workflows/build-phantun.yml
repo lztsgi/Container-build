@@ -1,0 +1,121 @@
+name: Build-Phantun
+
+on:
+  workflow_dispatch: # 手动触发
+
+# =================================================
+# 🟢 配置区域 (修改这里即可改变版本和名称)
+# =================================================
+env:
+  # 软件名称 (用于文件名)
+  APP_NAME: "phantun"
+  # 版本号 (用于 Release 标题和文件名)
+  APP_VERSION: "0.8.1"
+  # 平台前缀 (例如 phantun-linux-...)
+  FILE_PREFIX: "phantun-linux"
+# =================================================
+
+permissions:
+  contents: write # 允许创建 Release
+
+jobs:
+  build:
+    # 显示当前构建的架构
+    name: Build ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            platform: linux/arm64
+          - arch: amd64
+            platform: linux/amd64
+
+    steps:
+      # 修改点：从官方仓库拉取指定版本的源码
+      - name: Checkout Official Source
+        uses: actions/checkout@v4
+        with:
+          repository: dndx/phantun
+          ref: v${{ env.APP_VERSION }}
+          fetch-depth: 1
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 1. 动态生成通用 Dockerfile (Alpine)
+      - name: Generate Dockerfile
+        run: |
+          cat <<EOF > Dockerfile.alpine
+          # === 编译阶段 ===
+          FROM rust:alpine AS builder
+          WORKDIR /app
+          RUN apk add --no-cache musl-dev binutils
+          COPY . .
+          RUN cargo build --release
+          RUN strip target/release/server target/release/client
+
+          # === 运行阶段 ===
+          FROM alpine:latest
+          RUN apk add --no-cache ca-certificates tzdata
+
+          COPY --from=builder /app/target/release/client /usr/local/bin/phantun-client
+          COPY --from=builder /app/target/release/server /usr/local/bin/phantun-server
+          
+          # 生成通用启动脚本 (无 sleep 版)
+          RUN printf '#!/bin/sh\n\
+          set -e\n\
+          # sleep 3 (已移除)\n\
+          EXEC_NAME="phantun-server"\n\
+          if [ "\$RUN_MODE" = "client" ]; then EXEC_NAME="phantun-client"; fi\n\
+          if [ -z "\$LOCAL_ADDR" ]; then echo "Error: LOCAL_ADDR missing"; exit 1; fi\n\
+          if [ -z "\$REMOTE_ADDR" ]; then echo "Error: REMOTE_ADDR missing"; exit 1; fi\n\
+          ARGS=""\n\
+          if [ ! -z "\$TUN_NAME" ]; then ARGS="\$ARGS --tun \$TUN_NAME"; fi\n\
+          if [ ! -z "\$TUN_LOCAL" ]; then ARGS="\$ARGS --tun_local \$TUN_LOCAL"; fi\n\
+          if [ ! -z "\$TUN_PEER" ]; then ARGS="\$ARGS --tun_peer \$TUN_PEER"; fi\n\
+          echo "Starting Phantun (\$EXEC_NAME) on Alpine..."\n\
+          exec \$EXEC_NAME --local \$LOCAL_ADDR --remote \$REMOTE_ADDR \$ARGS "\$@"\n' > /usr/local/bin/docker-entrypoint.sh
+
+          RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+          ENV RUN_MODE="client" LOCAL_ADDR="" REMOTE_ADDR=""
+          # ENTRYPOINT ["docker-entrypoint.sh"]
+          ENTRYPOINT ["docker-entrypoint.sh"]
+          EOF
+
+      # 2. 构建并加载
+      - name: Build Image
+        run: |
+          echo ">>> Building for ${{ matrix.arch }}..."
+          docker buildx build --platform ${{ matrix.platform }} \
+            --load \
+            -f Dockerfile.alpine \
+            -t phantun:${{ matrix.arch }} .
+
+      # 3. 导出为 Tar 包 (使用自定义变量命名)
+      - name: Save to Tar
+        run: |
+          # 组合文件名: phantun-linux-0.8.1-arm64.tar
+          FILENAME="${{ env.FILE_PREFIX }}-${{ env.APP_VERSION }}-${{ matrix.arch }}.tar"
+          
+          docker save -o $FILENAME phantun:${{ matrix.arch }}
+          echo "Generated: $FILENAME"
+
+      # 4. 发布到 GitHub Releases
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        with:
+          # Tag 格式: v0.8.1-b4 (防止重复构建报错)
+          tag_name: v${{ env.APP_VERSION }}-b${{ github.run_number }}
+          # 标题格式: Phantun v0.8.1
+          name: ${{ env.APP_NAME }} v${{ env.APP_VERSION }}
+          # 上传的文件匹配模式
+          files: ${{ env.FILE_PREFIX }}-${{ env.APP_VERSION }}-${{ matrix.arch }}.tar
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
