@@ -432,3 +432,27 @@ jobs:
               2. `caddy-docker-universal-...tar` : Docker (无 DDNS)
               3. `caddy-ddns-docker-universal-...tar` : 集成版 Docker (含 DDNS + 启动等待网卡脚本)
           files: dist/*
+
+      - name: Remove superseded DDNS assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          CADDY_VER="${{ needs.check-version.outputs.caddy_ver }}"
+          DDNS_VER="${{ needs.check-version.outputs.ddns_ver }}"
+          KEEP_AMD64="caddy-ddns-docker-universal-${CADDY_VER}_ddns-${DDNS_VER}-amd64.tar"
+          KEEP_ARM64="caddy-ddns-docker-universal-${CADDY_VER}_ddns-${DDNS_VER}-arm64.tar"
+          RELEASE_ID=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$CADDY_VER" --jq '.id')
+
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?per_page=100" \
+            --jq '.[] | [.id, .name] | @tsv' |
+          while IFS=$'\t' read -r asset_id asset_name; do
+            case "$asset_name" in
+              caddy-ddns-docker-universal-${CADDY_VER}_ddns-*-amd64.tar|caddy-ddns-docker-universal-${CADDY_VER}_ddns-*-arm64.tar)
+                if [ "$asset_name" != "$KEEP_AMD64" ] && [ "$asset_name" != "$KEEP_ARM64" ]; then
+                  echo "Deleting superseded DDNS asset: $asset_name"
+                  gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+                fi
+                ;;
+            esac
+          done

@@ -44,11 +44,11 @@ jobs:
             exit 1
           fi
 
-          # 2. 按标签检查自己的 Release，避免与同仓库的 Caddy/Phantun Release 相互干扰
+          # 2. 检查固定的滚动 Release，只在当前版本附件不完整时构建
           NEED_BUILD=true
           LOCAL_VER="missing"
-          if LOCAL_RELEASE=$(github_api "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/tags/$AH_VER" 2>/dev/null); then
-            LOCAL_VER="$AH_VER"
+          if LOCAL_RELEASE=$(github_api "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/tags/adguardhome-pbr" 2>/dev/null); then
+            LOCAL_VER="rolling release"
             NEED_BUILD=false
             for arch in amd64 arm64; do
               ASSET="adguardhome-pbr-ros-${AH_VER}-${arch}.tar"
@@ -206,7 +206,7 @@ jobs:
       - name: Upload to Release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ needs.check-version.outputs.ah_ver }}
+          tag_name: adguardhome-pbr
           name: AdGuardHome PBR ${{ needs.check-version.outputs.ah_ver }}
           make_latest: true
           overwrite_files: true
@@ -225,3 +225,33 @@ jobs:
             adguardhome-pbr-ros-${{ needs.check-version.outputs.ah_ver }}-${{ matrix.arch }}.tar
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  cleanup-release-assets:
+    needs: [check-version, build-and-release]
+    name: Clean old AdGuardHome assets
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Keep only the current AdGuardHome version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          AH_VER="${{ needs.check-version.outputs.ah_ver }}"
+          KEEP_AMD64="adguardhome-pbr-ros-${AH_VER}-amd64.tar"
+          KEEP_ARM64="adguardhome-pbr-ros-${AH_VER}-arm64.tar"
+          RELEASE_ID=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/adguardhome-pbr" --jq '.id')
+
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?per_page=100" \
+            --jq '.[] | [.id, .name] | @tsv' |
+          while IFS=$'\t' read -r asset_id asset_name; do
+            case "$asset_name" in
+              adguardhome-pbr-ros-*-amd64.tar|adguardhome-pbr-ros-*-arm64.tar)
+                if [ "$asset_name" != "$KEEP_AMD64" ] && [ "$asset_name" != "$KEEP_ARM64" ]; then
+                  echo "Deleting superseded AdGuardHome asset: $asset_name"
+                  gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+                fi
+                ;;
+            esac
+          done
