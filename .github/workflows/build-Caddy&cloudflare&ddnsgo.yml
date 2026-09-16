@@ -11,25 +11,78 @@ env:
   # ⚠️ 全局统一：默认时区 (若运行时未指定 TZ 环境变量，则默认使用此时间)
   DEFAULT_TZ: "Asia/Shanghai"
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   check-version:
     runs-on: ubuntu-latest
     outputs:
       caddy_ver: ${{ steps.get_versions.outputs.caddy_ver }}
       ddns_ver: ${{ steps.get_versions.outputs.ddns_ver }}
+      need_build: ${{ steps.get_versions.outputs.need_build }}
     steps:
       - name: Get Upstream Versions
         id: get_versions
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          CADDY_VER=$(curl -s https://api.github.com/repos/caddyserver/caddy/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-          DDNS_VER=$(curl -s https://api.github.com/repos/jeessy2/ddns-go/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-          
+          set -Eeuo pipefail
+
+          github_api() {
+            curl --fail --silent --show-error --location \
+              --retry 5 --retry-delay 3 --retry-all-errors \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$1"
+          }
+
+          CADDY_VER=$(github_api "$GITHUB_API_URL/repos/caddyserver/caddy/releases/latest" | jq -er '.tag_name')
+          DDNS_VER=$(github_api "$GITHUB_API_URL/repos/jeessy2/ddns-go/releases/latest" | jq -er '.tag_name')
+
+          if [[ ! "$CADDY_VER" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]] || [[ ! "$DDNS_VER" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "Invalid upstream versions: Caddy='$CADDY_VER', DDNS-GO='$DDNS_VER'" >&2
+            exit 1
+          fi
+
           echo "caddy_ver=$CADDY_VER" >> $GITHUB_OUTPUT
           echo "ddns_ver=$DDNS_VER" >> $GITHUB_OUTPUT
           echo ">>> Target: Caddy $CADDY_VER | DDNS $DDNS_VER"
 
+          DDNS_NO_V="${DDNS_VER#v}"
+          EXPECTED_ASSETS=(
+            "caddy-linux-${CADDY_VER}-amd64"
+            "caddy-linux-${CADDY_VER}-arm64"
+            "caddy-docker-universal-${CADDY_VER}-amd64.tar"
+            "caddy-docker-universal-${CADDY_VER}-arm64.tar"
+            "caddy-ddns-docker-universal-${CADDY_VER}_ddns-${DDNS_VER}-amd64.tar"
+            "caddy-ddns-docker-universal-${CADDY_VER}_ddns-${DDNS_VER}-arm64.tar"
+          )
+
+          NEED_BUILD=true
+          if LOCAL_RELEASE=$(github_api "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/tags/$CADDY_VER" 2>/dev/null); then
+            NEED_BUILD=false
+            for asset in "${EXPECTED_ASSETS[@]}"; do
+              if ! jq -e --arg name "$asset" '.assets | map(.name) | index($name) != null' <<<"$LOCAL_RELEASE" >/dev/null; then
+                echo "Missing release asset: $asset"
+                NEED_BUILD=true
+              fi
+            done
+          else
+            echo "Release $CADDY_VER does not exist yet."
+          fi
+
+          echo "need_build=$NEED_BUILD" >> $GITHUB_OUTPUT
+          echo ">>> Build required: $NEED_BUILD"
+
   build-and-release:
     needs: check-version
+    if: needs.check-version.outputs.need_build == 'true' || github.event_name == 'workflow_dispatch'
     name: Build ${{ matrix.arch }}
     runs-on: ubuntu-latest
     # ⚠️ 新增：赋予推送 Packages 和 Releases 的权限
@@ -37,6 +90,7 @@ jobs:
       contents: write
       packages: write
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch: amd64
@@ -46,23 +100,24 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
-          go-version: '1.22'
+          go-version: stable
+          cache: false
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       # ⚠️ 关键修正：启用 Buildx 以支持 --load (解决 ROS 格式不兼容问题)
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       # ⚠️ 新增：登录 GitHub Container Registry (用于发布到 Packages)
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -75,9 +130,20 @@ jobs:
       # 1. 编译 Caddy 二进制 (保持不变)
       # ----------------------------------------------------------------
       - name: Build Binary & Prep
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -Eeuo pipefail
           CADDY_VER="${{ needs.check-version.outputs.caddy_ver }}"
           DDNS_VER="${{ needs.check-version.outputs.ddns_ver }}"
+
+          download_file() {
+            local url="$1"
+            local output="$2"
+            curl --fail --show-error --location \
+              --retry 5 --retry-delay 5 --retry-all-errors \
+              --output "$output" "$url"
+          }
           
           echo ">>> Building Caddy Binary..."
           GOOS=linux GOARCH=${{ matrix.goarch }} xcaddy build $CADDY_VER \
@@ -85,24 +151,42 @@ jobs:
             --output caddy
           
           # 压缩
-          wget -q https://github.com/upx/upx/releases/download/v4.2.2/upx-4.2.2-amd64_linux.tar.xz
+          download_file \
+            "https://github.com/upx/upx/releases/download/v4.2.2/upx-4.2.2-amd64_linux.tar.xz" \
+            "upx-4.2.2-amd64_linux.tar.xz"
           tar -xf upx-4.2.2-amd64_linux.tar.xz
-          mv upx-4.2.2-amd64_linux/upx /usr/local/bin/upx
+          install -m 0755 upx-4.2.2-amd64_linux/upx "$RUNNER_TEMP/upx"
           chmod +x caddy
-          upx --best --lzma caddy
+          "$RUNNER_TEMP/upx" --best --lzma caddy
           cp caddy caddy-linux-${CADDY_VER}-${{ matrix.arch }}
 
           # 准备 DDNS-GO
           echo ">>> Downloading DDNS-GO..."
           DDNS_NO_V=$(echo "$DDNS_VER" | sed 's/^v//')
           if [ "${{ matrix.goarch }}" == "amd64" ]; then DDNS_ARCH="x86_64"; else DDNS_ARCH="arm64"; fi
-          wget -q "https://github.com/jeessy2/ddns-go/releases/download/${DDNS_VER}/ddns-go_${DDNS_NO_V}_linux_${DDNS_ARCH}.tar.gz"
-          tar -zxf "ddns-go_${DDNS_NO_V}_linux_${DDNS_ARCH}.tar.gz"
+          DDNS_ASSET="ddns-go_${DDNS_NO_V}_linux_${DDNS_ARCH}.tar.gz"
+          DDNS_RELEASE=$(curl --fail --silent --show-error --location \
+            --retry 5 --retry-delay 3 --retry-all-errors \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$GITHUB_API_URL/repos/jeessy2/ddns-go/releases/tags/$DDNS_VER")
+          DDNS_URL=$(jq -er --arg name "$DDNS_ASSET" '.assets[] | select(.name == $name) | .browser_download_url' <<<"$DDNS_RELEASE")
+          DDNS_DIGEST=$(jq -er --arg name "$DDNS_ASSET" '.assets[] | select(.name == $name) | .digest' <<<"$DDNS_RELEASE")
+
+          download_file "$DDNS_URL" "$DDNS_ASSET"
+          if [[ ! "$DDNS_DIGEST" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
+            echo "Missing or invalid SHA-256 digest for $DDNS_ASSET" >&2
+            exit 1
+          fi
+          echo "${DDNS_DIGEST#sha256:}  $DDNS_ASSET" | sha256sum --check --strict
+
+          tar -zxf "$DDNS_ASSET"
           mv ddns-go ddns
           chmod +x ddns
           
           # ⚠️ 新增：对 DDNS 也进行极限压缩以减小镜像体积
-          upx --best --lzma ddns
+          "$RUNNER_TEMP/upx" --best --lzma ddns
 
       # ----------------------------------------------------------------
       # 2. 构建 Pure Universal Docker (逻辑2：合并 Linux & ROS)
@@ -262,37 +346,89 @@ jobs:
           docker push $DDNS_IMAGE:${COMBINED_TAG}-${{ matrix.arch }}
           docker push $DDNS_IMAGE:latest-${{ matrix.arch }}
 
-      # ----------------------------------------------------------------
-      # 4. 上传 (文件精简为 3 类)
-      # ----------------------------------------------------------------
+      - name: Stage release files
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.arch }}
+          path: |
+            caddy-linux-${{ needs.check-version.outputs.caddy_ver }}-${{ matrix.arch }}
+            caddy-docker-universal-${{ needs.check-version.outputs.caddy_ver }}-${{ matrix.arch }}.tar
+            caddy-ddns-docker-universal-${{ needs.check-version.outputs.caddy_ver }}_ddns-${{ needs.check-version.outputs.ddns_ver }}-${{ matrix.arch }}.tar
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  publish:
+    needs: [check-version, build-and-release]
+    name: Publish release and manifests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Download release files
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish multi-platform image manifests
+        run: |
+          set -Eeuo pipefail
+          CADDY_VER="${{ needs.check-version.outputs.caddy_ver }}"
+          DDNS_VER="${{ needs.check-version.outputs.ddns_ver }}"
+          COMBINED_TAG="${CADDY_VER}_ddns-${DDNS_VER}"
+          REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          PURE_IMAGE="ghcr.io/$REPO_LOWER/caddy-pure"
+          DDNS_IMAGE="ghcr.io/$REPO_LOWER/caddy-ddns"
+
+          docker buildx imagetools create \
+            --tag "$PURE_IMAGE:$CADDY_VER" \
+            --tag "$PURE_IMAGE:latest" \
+            "$PURE_IMAGE:$CADDY_VER-amd64" \
+            "$PURE_IMAGE:$CADDY_VER-arm64"
+
+          docker buildx imagetools create \
+            --tag "$DDNS_IMAGE:$COMBINED_TAG" \
+            --tag "$DDNS_IMAGE:latest" \
+            "$DDNS_IMAGE:$COMBINED_TAG-amd64" \
+            "$DDNS_IMAGE:$COMBINED_TAG-arm64"
+
       - name: Upload to Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.check-version.outputs.caddy_ver }}
           name: Caddy ${{ needs.check-version.outputs.caddy_ver }}
           make_latest: true
-          allow_updates: true
+          overwrite_files: true
+          fail_on_unmatched_files: true
           body: |
               ## 📦 Build Summary (with Cloudflare Plugin)
               - **Caddy**: ${{ needs.check-version.outputs.caddy_ver }}
               - **DDNS-GO**: ${{ needs.check-version.outputs.ddns_ver }}
-              
+
               ### 🛠️ 功能
               1. **ROS/Linux 通用化**: 所有 `.tar` 均可直接导入 RouterOS 7.x 或 `docker load`。
-              2. **GitHub Packages 支持**: 镜像已同步推送至 `ghcr.io`，支持直接 `docker pull` 拉取 (按对应架构)。
+              2. **GitHub Packages 支持**: 镜像已同步推送至 `ghcr.io`，同时提供 amd64、arm64 和统一的多架构标签。
               3. **智能网络等待**: DDNS 版镜像支持通过环境变量 `CHECK_MODE` 控制启动等待逻辑。
                  - `CHECK_MODE=ipv6` : 等待 IPv6 Global 地址 (推荐 ROS 用户)
                  - `CHECK_MODE=ipv4` : 等待 IPv4 地址
                  - `CHECK_MODE=auto` : 任意 IP 即启动 (默认)
-              4. **文件读取 Token 特性**: 镜像启动时会自动检测并读取 `${{ env.ENV_FILE_PATH }}` 文件（若存在），支持将含有高敏感信息（如 Cloudflare Token）的环境变量文件进行挂载引用，完美兼容原有环境变量部署方式。
-              
+              4. **文件读取 Token 特性**: 镜像启动时会自动检测并读取 `${{ env.ENV_FILE_PATH }}` 文件（若存在），支持将含有高敏感信息（如 Cloudflare Token）的环境变量文件进行挂载引用。
+
               ### 📂 文件列表
               1. `caddy-linux-v...` : 二进制文件
               2. `caddy-docker-universal-...tar` : Docker (无 DDNS)
               3. `caddy-ddns-docker-universal-...tar` : 集成版 Docker (含 DDNS + 启动等待网卡脚本)
-          files: |
-            caddy-linux-${{ needs.check-version.outputs.caddy_ver }}-${{ matrix.arch }}
-            caddy-docker-universal-${{ needs.check-version.outputs.caddy_ver }}-${{ matrix.arch }}.tar
-            caddy-ddns-docker-universal-${{ needs.check-version.outputs.caddy_ver }}_ddns-${{ needs.check-version.outputs.ddns_ver }}-${{ matrix.arch }}.tar
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          files: dist/*
